@@ -27,6 +27,26 @@ def show_ai_error(error: Exception) -> None:
         st.info("Start Ollama and make sure the server URL is correct in sidebar settings.")
         return
 
+    if "timed out" in lowered or "timeout" in lowered:
+        st.error("Ollama request timed out.")
+        st.info(
+            "Model generation took too long. Try a smaller model, run one request at a time, "
+            "or increase OLLAMA_REQUEST_TIMEOUT_SECONDS / OLLAMA_VISION_TIMEOUT_SECONDS."
+        )
+        return
+
+    if (
+        "runner process has terminated" in lowered
+        or "exit status 2" in lowered
+        or "model crashed while loading/running" in lowered
+    ):
+        st.error("Ollama model process crashed while generating response.")
+        st.info(
+            "Try a smaller model (for example gemma:2b for text, moondream for vision), "
+            "close heavy apps, or disable image analysis for this run."
+        )
+        return
+
     st.error(f"AI request failed: {message}")
 
 
@@ -87,12 +107,12 @@ with st.sidebar:
     )
     enable_image_analysis = st.checkbox(
         "Enable Image Analysis",
-        value=True,
+        value=False,
         help="Uses a vision model in Ollama to summarize images in the current slide/page.",
     )
     vision_model = st.text_input(
         "Ollama Vision Model",
-        value=os.getenv("OLLAMA_VISION_MODEL", "llava:7b"),
+        value=os.getenv("OLLAMA_VISION_MODEL", "moondream"),
         help="Example: llava:7b, llava:13b, minicpm-v",
     )
     st.caption(

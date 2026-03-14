@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import re
+import socket
+import time
 from typing import Dict, List
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -12,6 +15,29 @@ from urllib.request import Request, urlopen
 DEFAULT_MODEL = "gemma:2b"
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
 DEFAULT_VISION_MODEL = "llava:7b"
+DEFAULT_TEXT_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_REQUEST_TIMEOUT_SECONDS", "240"))
+DEFAULT_VISION_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_VISION_TIMEOUT_SECONDS", "300"))
+DEFAULT_MAX_RETRIES = int(os.getenv("OLLAMA_MAX_RETRIES", "2"))
+
+
+def _is_timeout_exception(error: Exception) -> bool:
+    if isinstance(error, (socket.timeout, TimeoutError)):
+        return True
+
+    if isinstance(error, URLError) and isinstance(error.reason, (socket.timeout, TimeoutError)):
+        return True
+
+    return "timed out" in str(error).lower() or "timeout" in str(error).lower()
+
+
+def _is_runner_crash_error(message: str) -> bool:
+    lowered = message.lower()
+    return (
+        "runner process has terminated" in lowered
+        or "exit status 2" in lowered
+        or "unable to allocate cpu buffer" in lowered
+        or "error loading model" in lowered
+    )
 
 
 def _clean_markdown(text: str) -> str:
@@ -32,6 +58,10 @@ def _build_explainer_prompt(slide_text: str, context_text: str = "") -> str:
         "Explain the following slide content in very simple language so a student can "
         "understand it easily.\n"
         "Then generate 3 important questions from the content and provide clear answers.\n"
+        "If the slide already contains direct questions, answer them naturally inside the explanation.\n"
+        "Do not create a separate label like 'Questions found in the slide'.\n"
+        "The 3 generated questions in the Questions section should be separate study questions.\n"
+        "Do not copy slide questions verbatim into the generated Questions section.\n"
         "Do not use markdown symbols like ** or bullet points.\n\n"
         f"{context_block}"
         "Slide Content:\n"
@@ -142,8 +172,8 @@ def _call_ollama(prompt: str, model: str = DEFAULT_MODEL, base_url: str = DEFAUL
         "model": model,
         "prompt": prompt,
         "stream": False,
-        # Free model from memory after response to reduce RAM pressure.
-        "keep_alive": "0s",
+        # Keep text model warm for a while to avoid repeated load/unload crashes.
+        "keep_alive": "10m",
     }
 
     request = Request(
@@ -153,20 +183,52 @@ def _call_ollama(prompt: str, model: str = DEFAULT_MODEL, base_url: str = DEFAUL
         method="POST",
     )
 
-    try:
-        with urlopen(request, timeout=120) as response:
-            body = response.read().decode("utf-8")
-            parsed = json.loads(body)
-    except HTTPError as error:
-        body = error.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Ollama HTTP {error.code}: {body}") from error
-    except URLError as error:
-        raise RuntimeError(
-            "Could not connect to Ollama. Make sure Ollama is running on "
-            f"{base_url}."
-        ) from error
-    except Exception as error:
-        raise RuntimeError(f"Ollama request failed: {error}") from error
+    parsed: Dict[str, object] = {}
+    for attempt in range(DEFAULT_MAX_RETRIES + 1):
+        try:
+            with urlopen(request, timeout=DEFAULT_TEXT_TIMEOUT_SECONDS) as response:
+                body = response.read().decode("utf-8")
+                parsed = json.loads(body)
+            break
+        except HTTPError as error:
+            body = error.read().decode("utf-8", errors="replace")
+            if _is_runner_crash_error(body):
+                raise RuntimeError(
+                    "Ollama model crashed while loading/running (likely low RAM/VRAM). "
+                    "Use a smaller model, close other heavy apps, or disable image analysis."
+                ) from error
+            raise RuntimeError(f"Ollama HTTP {error.code}: {body}") from error
+        except URLError as error:
+            if _is_timeout_exception(error):
+                if attempt < DEFAULT_MAX_RETRIES:
+                    time.sleep(1.0 + attempt)
+                    continue
+                raise RuntimeError(
+                    "Ollama request timed out after "
+                    f"{DEFAULT_TEXT_TIMEOUT_SECONDS}s. Increase OLLAMA_REQUEST_TIMEOUT_SECONDS, "
+                    "or use a smaller/faster model."
+                ) from error
+            raise RuntimeError(
+                "Could not connect to Ollama. Make sure Ollama is running on "
+                f"{base_url}."
+            ) from error
+        except Exception as error:
+            message = str(error)
+            if _is_runner_crash_error(message):
+                raise RuntimeError(
+                    "Ollama model crashed while loading/running (likely low RAM/VRAM). "
+                    "Use a smaller model, close other heavy apps, or disable image analysis."
+                ) from error
+            if _is_timeout_exception(error):
+                if attempt < DEFAULT_MAX_RETRIES:
+                    time.sleep(1.0 + attempt)
+                    continue
+                raise RuntimeError(
+                    "Ollama request timed out after "
+                    f"{DEFAULT_TEXT_TIMEOUT_SECONDS}s. Increase OLLAMA_REQUEST_TIMEOUT_SECONDS, "
+                    "or use a smaller/faster model."
+                ) from error
+            raise RuntimeError(f"Ollama request failed: {error}") from error
 
     output = str(parsed.get("response", "")).strip()
     if not output:
@@ -206,20 +268,41 @@ def _call_ollama_vision(
         method="POST",
     )
 
-    try:
-        with urlopen(request, timeout=180) as response:
-            body = response.read().decode("utf-8")
-            parsed = json.loads(body)
-    except HTTPError as error:
-        body = error.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Ollama vision HTTP {error.code}: {body}") from error
-    except URLError as error:
-        raise RuntimeError(
-            "Could not connect to Ollama vision endpoint. Make sure Ollama is running on "
-            f"{base_url}."
-        ) from error
-    except Exception as error:
-        raise RuntimeError(f"Ollama vision request failed: {error}") from error
+    parsed: Dict[str, object] = {}
+    for attempt in range(DEFAULT_MAX_RETRIES + 1):
+        try:
+            with urlopen(request, timeout=DEFAULT_VISION_TIMEOUT_SECONDS) as response:
+                body = response.read().decode("utf-8")
+                parsed = json.loads(body)
+            break
+        except HTTPError as error:
+            body = error.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"Ollama vision HTTP {error.code}: {body}") from error
+        except URLError as error:
+            if _is_timeout_exception(error):
+                if attempt < DEFAULT_MAX_RETRIES:
+                    time.sleep(1.0 + attempt)
+                    continue
+                raise RuntimeError(
+                    "Ollama vision request timed out after "
+                    f"{DEFAULT_VISION_TIMEOUT_SECONDS}s. Increase OLLAMA_VISION_TIMEOUT_SECONDS, "
+                    "or use a smaller vision model."
+                ) from error
+            raise RuntimeError(
+                "Could not connect to Ollama vision endpoint. Make sure Ollama is running on "
+                f"{base_url}."
+            ) from error
+        except Exception as error:
+            if _is_timeout_exception(error):
+                if attempt < DEFAULT_MAX_RETRIES:
+                    time.sleep(1.0 + attempt)
+                    continue
+                raise RuntimeError(
+                    "Ollama vision request timed out after "
+                    f"{DEFAULT_VISION_TIMEOUT_SECONDS}s. Increase OLLAMA_VISION_TIMEOUT_SECONDS, "
+                    "or use a smaller vision model."
+                ) from error
+            raise RuntimeError(f"Ollama vision request failed: {error}") from error
 
     message = parsed.get("message", {})
     content = str(message.get("content", "")).strip()
@@ -282,6 +365,9 @@ def _extract_fallback_questions(raw_response: str) -> List[str]:
     for line in raw_response.splitlines():
         stripped = line.strip()
         if not stripped:
+            continue
+        lowered = stripped.lower()
+        if "found in the slide" in lowered:
             continue
         plain = re.sub(r"^\d+[\.)]\s*", "", stripped)
         if "?" in plain and plain not in questions:

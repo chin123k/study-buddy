@@ -84,6 +84,9 @@ streamlit run main.py
 - OLLAMA_BASE_URL (default: http://127.0.0.1:11434)
 - OLLAMA_MODEL (default: gemma:2b)
 - OLLAMA_VISION_MODEL (default: llava:7b)
+- OLLAMA_REQUEST_TIMEOUT_SECONDS (default: 240)
+- OLLAMA_VISION_TIMEOUT_SECONDS (default: 300)
+- OLLAMA_MAX_RETRIES (default: 2)
 - OLLAMA_MODELS (optional custom model directory)
 
 ### Redis
@@ -124,7 +127,12 @@ The app uses session-scoped Redis keys and TTL.
 - Switch to smaller vision model (example: moondream)
 - Keep image analysis enabled only when needed
 
-3. Redis not connected:
+3. Ollama request timed out:
+- Increase OLLAMA_REQUEST_TIMEOUT_SECONDS (text) and OLLAMA_VISION_TIMEOUT_SECONDS (vision)
+- Use a smaller/faster model
+- Retry once after model warm-up (first request can be slower)
+
+4. Redis not connected:
 - App still works using Streamlit in-memory cache
 - Check REDIS_URL and Redis server status
 
